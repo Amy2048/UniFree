@@ -268,17 +268,20 @@ fn main() {
 1. 验证许可证文件的 XML 数字签名
 2. 验证 PACL（来自 Unity 服务器）的签名
 
-#### IL 级补丁方法
+#### IL 级补丁方法（历史方案，现由就地补丁实现）
+
+> ⚠️ 注意操作码：`throw` 是 **0x7A**，`ret` 才是 0x2A（早期 `tools/patch-dll`
+> 的原始字节扫描误用 0x2A，勿再参考）。
 
 1. 搜索错误字符串 `"The digital signature is invalid."` 的 UTF-16 编码
-2. 向前搜索 IL 指令模式：`ldstr` (0x72) + `newobj` (0x73) + `throw` (0x2A)
+2. 向前搜索 IL 指令模式：`ldstr` (0x72) + `newobj` (0x73) + `throw` (0x7A)
 3. 将这三条指令 NOP 掉（替换为 0x00）
 
 ```
 原始 IL:
   ldstr "The digital signature is invalid."  // 0x72 XX XX XX XX
   newobj InvalidDataException                // 0x73 XX XX XX XX
-  throw                                      // 0x2A
+  throw                                      // 0x7A
 
 补丁后:
   nop                                        // 0x00
@@ -293,23 +296,48 @@ fn main() {
 ```
 原始 IL:
   callvirt CheckSignature                    // 0x6F XX XX XX XX
-  brtrue.s <label>                           // 0x2D XX
+  brtrue.s <label>                           // 0x2D XX  （签名有效 → 跳过错误块）
 
-补丁后:
+补丁后（等价形式；就地补丁用 13 字节等长替换）:
   callvirt CheckSignature                    // 0x6F XX XX XX XX
+  pop                                        // 0x26  （丢弃 bool，落地即成功路径）
   nop                                        // 0x00
   nop                                        // 0x00
 ```
 
-### 当前实现
+### 当前实现（就地 IL 补丁为主，预编译为回退）
 
-对于 < 6000.7 版本，`patch_entitlement_resolver()` 直接替换为预编译的补丁 DLL。
-预编译 DLL 按 Unity 主版本组织在 `src-tauri/resources/win/` 目录下。
+对于 < 6000.7 版本，`patch_entitlement_resolver()` / `patch_hub_licensing_client()`
+**默认使用就地字节级 IL 补丁**（`src-tauri/src/il_patch.rs`）：
 
-### 6000.0-6000.6 的两个发行线（LocalIPC 1.17.x vs 1.18+）
+1. 全文件扫描 `0x2D 0x?? 0x72 t0..t3 0x73 m0..m3 0x7A`（`brtrue.s + ldstr + newobj +
+   throw`，注意 throw 是 **0x7A**，0x2A 是 ret），并用 `ldstr` token 反查 `#US` 堆
+   精确匹配字符串 `"The digital signature is invalid."`（堆里存在 66/67 字节两种
+   编码变体，容忍尾部 0x00/0xFF 填充）；
+2. 每处站点改写为 `0x26( pop ) + 12×0x00( nop )`（13 字节等长替换，栈语义等价：
+   pop 消费 CheckSignature 的 bool，执行流穿过原错误块落到 `ret`）；
+3. **必须同时清零 CLI 头的 `ManagedNativeHeader`（RVA+Size，偏移 +64/+68）**：
+   Unity 的 resolver 是 **ReadyToRun（RTR）镜像**，运行时优先执行 R2R 原生代码，
+   只改 IL 时运行期行为不变（dnlib 读 IL 会"验证通过"，运行期仍在执行旧原生码）；
+   清零后运行时按纯 IL 加载并从补丁后的 IL 重新 JIT。该操作幂等无害（dnlib 重写
+   产物本来就没有 native header）。
 
-6000.3.x 编辑器自带的 licensing client 分两个发行线，**预编译补丁 DLL 必须与
-client 发行线匹配**，否则 editor 自带的 client 根本无法启动：
+就地补丁**保留程序集身份与全部元数据**（版本、引用运行时、方法表、EH、局部变量），
+因此**不依赖 LocalIPC 发行线**（1.17.x / 1.18+ / 未来新线通吃）——只要
+`ValidateSignature` 的 IL 结构未改型即可命中。命中失败（结构改型）时回退到下面的
+预编译补丁 DLL + 按发行线匹配逻辑。
+
+验证工具（均需真实 DLL）：
+- `tools/verify-resolver`：dnlib 加载 + 指令流检查（无残留错误字符串 ldstr、
+  Pop+3×Nop 补丁形态、R2R 状态）；
+- `tools/resolver-invoke`：反射直接调用 `XmlExtensions.ValidateSignature` 验证语义；
+- 端到端：把补丁后的 resolver 放进完整 licensing client 目录启动 client，日志应出现
+  `Successfully parsed (ULF) license ...` 且无 `The digital signature is invalid.`。
+
+### 回退方案：6000.0-6000.6 的两个发行线（LocalIPC 1.17.x vs 1.18+）
+
+就地补丁未命中时的回退。6000.3.x 编辑器自带的 licensing client 分两个发行线，
+**预编译补丁 DLL 必须与 client 发行线匹配**，否则 editor 自带的 client 根本无法启动：
 
 | client 线 | 代表版本 | 原版 EntitlementResolver | 补丁 DLL |
 |-----------|---------|--------------------------|---------|
@@ -373,9 +401,20 @@ licensing client 的 `Unity.Licensing.EntitlementResolver.dll`（1.17.4，~514KB
   `505 Unsupported protocol version` → 编辑器继续用自己的补丁 client，行为不变。
   补丁 Hub resolver 时也只结束 `UnityLicensingClient_V1` 目录下的 client 进程，
   不会误杀编辑器自己的 client。
-- 仅支持 Hub licensing client LocalIPC **1.17.x**（由
-  `UnityLicensingClient_V1/Unity.Licensing.Client.deps.json` 识别）；
-  其他版本 line 时 `patch_hub()` 会输出警告并跳过该 DLL。
+- 支持 Hub licensing client LocalIPC **1.17.x**（Hub 3.20.0 时代，补丁 DLL 保留程序集
+  版本 1.17.4.0）与 **1.18+**（Hub 3.21.1 起，如 1.18.3，用与编辑器 1.18 线相同的
+  补丁 DLL），发行线由 `UnityLicensingClient_V1/Unity.Licensing.Client.deps.json` 中
+  的 `"Unity.Licensing.Client/<ver>"` 自动识别；其他版本 line 时 `patch_hub()`
+  会输出警告并跳过该 DLL。
+
+> ⚠️ **为什么必须补 Hub 的 resolver（Hub 3.21.1+）**：Hub 3.21.1 的 licensing client
+> 已升级到 LocalIPC 1.18.x，与 6000.3.20f1/22f1/23f1 编辑器 client **协议版本相同**，
+> 编辑器会优先连接全局管道 `LicenseClient-wbn`（Hub client）而**不启动自己已补丁的
+> client**；若 Hub resolver 未补丁，UlfLicense.Parse 抛
+> `The digital signature is invalid.` → `Processed 0 license files` →
+> `Found 0 entitlement groups` → 编辑器退出码 198（"No valid Unity Editor license
+> found."）。补丁后需重启 licensing client 进程
+> （`taskkill /F /IM Unity.Licensing.Client.exe`）。
 
 > 注：Editor.log 中 `Code 1 while verifying Licensing Client signature ...
 > LicensingClient has failed validation; ignoring` 属正常现象（2019.x 同理），
@@ -454,6 +493,19 @@ licensing client 进程仍会因原始 DLL 报 "signature invalid"，但 JS 层�
 
 ## 更新日志
 
+- 2026-09-04: 新增**就地 IL 补丁**（`il_patch.rs`），取代预编译 DLL 作为默认方案：
+  等长改写 ValidateSignature 的 `brtrue.s+ldstr+newobj+throw` 为
+  `pop+nop×12`，并**清零 CLI 头 ManagedNativeHeader 禁用 ReadyToRun**（关键：
+  Unity resolver 是 RTR 镜像，只改 IL 会在运行期仍执行旧 R2R 原生码）。
+  保留程序集身份 → 任意 LocalIPC 线（1.17.x/1.18+/未来）通吃；未命中时回退
+  预编译 DLL 按线匹配。新增 `tools/verify-resolver`、`tools/resolver-invoke`。
+  同日适配 Hub 3.21.1 licensing client（LocalIPC 1.18.3）：
+  现象：6000.3.23f1 编辑器已打补丁仍报 "No valid Unity Editor license found."
+  （退出码 198）。根因：Hub 3.21.1 把自带 licensing client 从 1.17.4 升级为
+  1.18.3，与编辑器（1.18.3）协议版本一致 → 编辑器优先连接全局管道使用
+  **未补丁的 Hub client** → 其 EntitlementResolver 拒绝 UniFree 签名的 ULF
+  （`The digital signature is invalid.`）→ 0 个 entitlement。修复：
+  `patch_hub_licensing_client()` 增加 1.18+ 线支持（就地补丁优先）。
 - 2026-08-22: 修复 6000.3.10f1（LocalIPC 1.17.4）patch 后仍报
   "No valid Unity Editor license found."。根因：(1) 捆绑的 0.0.0.0 补丁
   EntitlementResolver 与 1.17.4 client（deps 声明 1.17.4.0）不匹配，editor 自带

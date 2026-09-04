@@ -159,6 +159,22 @@ pub fn patch_entitlement_resolver(dll_path: &str, display_version: Option<&str>)
 
     // Select the replacement by target filename, not by the install directory.
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+
+    // IL resolver：优先"就地字节级补丁"（保留程序集身份，1.17.x / 1.18+ / 未来任何
+    // LocalIPC 线通用，无需按线挑选预编译 DLL）；命不中才回退到按发行线匹配的
+    // 预编译补丁 DLL（原逻辑，见下）。
+    if file_name == "Unity.Licensing.EntitlementResolver.dll" {
+        match patch_entitlement_resolver_inplace(dll_path) {
+            Ok(msg) => return Ok(msg),
+            Err(e) => {
+                eprintln!(
+                    "⚠ In-place IL patch not applicable ({}); falling back to precompiled resolver",
+                    e
+                );
+            }
+        }
+    }
+
     let target_version = display_version.unwrap_or("unknown");
     let (target_kind, patched_dll): (&str, &[u8]) = match file_name {
         "System.Security.Cryptography.Xml.dll" => (
@@ -217,6 +233,33 @@ pub fn patch_entitlement_resolver(dll_path: &str, display_version: Option<&str>)
         "Patched: replaced with pre-patched DLL for Unity {} ({})",
         target_version, target_kind
     ))
+}
+
+/// 就地 IL 字节补丁 resolver：任意 LocalIPC 线通用（程序集身份、方法表、局部变量、
+/// 异常处理子句全部原样保留，只改写 ValidateSignature 内 4 条指令）。
+/// 幂等：已处于补丁状态（含已被预编译补丁 DLL 替换过的情况）直接返回成功。
+fn patch_entitlement_resolver_inplace(dll_path: &str) -> Result<String, String> {
+    let path = Path::new(dll_path);
+    let data = fs::read(path).map_err(|e| format!("Failed to read resolver: {}", e))?;
+    match crate::il_patch::patch_resolver(&data) {
+        Ok((patched, report)) if report.patched_sites > 0 => {
+            let bak = format!("{}.bak", dll_path);
+            if !Path::new(&bak).exists() {
+                fs::copy(path, &bak).map_err(|e| format!("Failed to backup resolver: {}", e))?;
+            }
+            fs::write(path, &patched)
+                .map_err(|e| format!("Failed to write patched resolver: {}", e))?;
+            Ok(format!(
+                "Patched in-place (IL byte patch, {} site(s)); assembly identity preserved, works for any LocalIPC line",
+                report.patched_sites
+            ))
+        }
+        Ok((_, report)) => Ok(format!(
+            "Already patched in-place ({} site(s) detected)",
+            report.already_patched_sites
+        )),
+        Err(e) => Err(format!("in-place IL patch not applicable: {}", e)),
+    }
 }
 
 /// 从 Unity.Licensing.Client.deps.json 读取 licensing client 发行线版本
@@ -434,8 +477,11 @@ pub fn patch_hub(disable_signin: bool, disable_update: bool) -> Result<String, S
     let patched_files = rewrite_hub_asar(&asar_path, disable_signin, disable_update)?;
 
     // Hub 自带 licensing client（UnityLicensingClient_V1）的 EntitlementResolver 一并打补丁
-    // （LocalIPC 1.17.x 线，与编辑器 6000.3.10f1 等同一版本族）。
-    // 这样"从 Hub 启动的编辑器"经由 Hub 的 licensing client 也能通过 ULF 签名校验，
+    // （LocalIPC 1.17.x 线＝Hub 3.20.0，与编辑器 6000.3.10f1 同一版本族；
+    //   LocalIPC 1.18+ 线＝Hub 3.21.1 起，与编辑器 6000.3.20f1/22f1/23f1 同线）。
+    // 这样"从 Hub 启动的编辑器"经由 Hub 的 licensing client 也能通过 ULF 签名校验——
+    // 否则只要 Hub client 与编辑器 client 版本相同（协议匹配），编辑器会优先使用
+    // Hub 的（未补丁）client → "The digital signature is invalid." → 0 entitlement → 退出 198。
     // **无需额外启动独立 IPC 进程**：Hub 启动/重启时自动拉起其 client（补丁一次永久生效）。
     let hub_dir = asar_path.parent().and_then(|p| p.parent()).unwrap_or_else(|| Path::new(""));
     let resolver_note = match patch_hub_licensing_client(hub_dir) {
@@ -457,36 +503,92 @@ pub fn patch_hub(disable_signin: bool, disable_update: bool) -> Result<String, S
     ))
 }
 
-/// 替换 Hub 自带 licensing client 的 `Unity.Licensing.EntitlementResolver.dll`
-/// （LocalIPC 1.17.x）为预补丁版本：补丁 ValidateSignature 使其接受任意签名的 ULF。
+/// 补丁 Hub 自带 licensing client 的 `Unity.Licensing.EntitlementResolver.dll`：
+/// 优先"就地 IL 字节补丁"（任意 LocalIPC 线通用，保留程序集身份；1.17.x / 1.18+ /
+/// 未来新线都能命中，只要 ValidateSignature 的 IL 结构未改型）；命不中时按 LocalIPC
+/// 发行线回退到预编译补丁 DLL（1.17.x = Hub 3.20.0 时代 / 1.18+ = Hub 3.21.1 起）。
 /// 备份为 `<dll>.bak`；已补丁（内容一致）时跳过。需要管理员权限（Program Files）。
-fn patch_hub_licensing_client(hub_dir: &Path) -> Result<String, String> {    let licensing_dir = hub_dir.join("UnityLicensingClient_V1");
+fn patch_hub_licensing_client(hub_dir: &Path) -> Result<String, String> {
+    let licensing_dir = hub_dir.join("UnityLicensingClient_V1");
     let resolver = licensing_dir.join("Unity.Licensing.EntitlementResolver.dll");
     if !resolver.exists() {
         return Err(format!("not found: {}", resolver.display()));
     }
     let ver = licensing_client_version(&licensing_dir).unwrap_or_else(|| "unknown".into());
-    if !ver.starts_with("1.17") {
-        return Err(format!("licensing client 版本 {} 非 1.17.x，暂未适配", ver));
-    }
-    // 只结束 Hub 目录下的 licensing client（另一个进程会随后重新拉起并加载补丁后的 DLL）；
-    // 不碰编辑器自己的 client（1.18+ 编辑器走独立目录/独立进程/版本化管道，互不影响）
-    kill_hub_licensing_clients(&licensing_dir);
 
-    // 幂等：已是补丁版本则直接返回
-    let patched: &[u8] =
-        include_bytes!("../resources/win/Unity.Licensing.EntitlementResolver.hub.1.17.4.dll");
-    if fs::read(&resolver).map(|d| d.as_slice() == patched).unwrap_or(false) {
-        return Ok("hub licensing client resolver already patched".into());
-    }
+    // 就地 IL 补丁（首选，与 LocalIPC 线无关）
+    let data = fs::read(&resolver).map_err(|e| format!("Failed to read hub resolver: {}", e))?;
+    match crate::il_patch::patch_resolver(&data) {
+        Ok((patched, report)) => {
+            // 只结束 Hub 目录下的 licensing client（另一个进程会随后重新拉起并加载补丁后的 DLL）；
+            // 不碰编辑器自己的 client（1.18+ 编辑器走独立目录/独立进程/版本化管道，互不影响）
+            kill_hub_licensing_clients(&licensing_dir);
+            if report.patched_sites > 0 {
+                let bak = licensing_dir.join("Unity.Licensing.EntitlementResolver.dll.bak");
+                if !bak.exists() {
+                    fs::copy(&resolver, &bak)
+                        .map_err(|e| format!("Failed to backup hub resolver: {}", e))?;
+                }
+                fs::write(&resolver, &patched)
+                    .map_err(|e| format!("Failed to write patched hub resolver: {}", e))?;
+                Ok(format!(
+                    "hub licensing client resolver patched in-place (LocalIPC v{}, {} site(s)); editors launched from Hub now bypass ULF signature check",
+                    ver, report.patched_sites
+                ))
+            } else {
+                Ok(format!(
+                    "hub licensing client resolver already patched in-place (LocalIPC v{}, {} site(s) detected)",
+                    ver, report.already_patched_sites
+                ))
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠ Hub resolver in-place IL patch not applicable ({}); falling back by LocalIPC line",
+                e
+            );
+            // 回退按发行线选择预编译补丁 DLL：
+            // - 1.17.x（Hub 3.20.0 时代）：EntitlementResolver 程序集版本 1.17.4.0（v7 运行时），
+            //   必须用基于 1.17.4 原版生成的补丁 DLL（保留程序集版本），否则 client 启动即崩。
+            // - 1.18+（Hub 3.21.1 起，如 6000.3.20f1/22f1/23f1 同线）：程序集版本 0.0.0.0
+            //   （v8 运行时），用与编辑器 1.18 线相同的补丁 DLL 即可。
+            let (line, patched): (&str, &[u8]) = if ver.starts_with("1.17") {
+                (
+                    "LocalIPC 1.17.x",
+                    include_bytes!("../resources/win/Unity.Licensing.EntitlementResolver.hub.1.17.4.dll"),
+                )
+            } else if ver.starts_with("1.18") {
+                (
+                    "LocalIPC 1.18+",
+                    include_bytes!("../resources/win/Unity.Licensing.EntitlementResolver.dll"),
+                )
+            } else {
+                return Err(format!(
+                    "licensing client 版本 {} 非 1.17.x/1.18+ 且就地 IL 补丁未命中（{}），暂未适配",
+                    ver, e
+                ));
+            };
+            kill_hub_licensing_clients(&licensing_dir);
 
-    // 备份 + 替换
-    let bak = licensing_dir.join("Unity.Licensing.EntitlementResolver.dll.bak");
-    if !bak.exists() {
-        fs::copy(&resolver, &bak).map_err(|e| format!("Failed to backup hub resolver: {}", e))?;
+            // 幂等：已是对应线的补丁版本则直接返回
+            if fs::read(&resolver).map(|d| d.as_slice() == patched).unwrap_or(false) {
+                return Ok(format!("hub licensing client resolver already patched ({})", line));
+            }
+
+            // 备份 + 替换
+            let bak = licensing_dir.join("Unity.Licensing.EntitlementResolver.dll.bak");
+            if !bak.exists() {
+                fs::copy(&resolver, &bak)
+                    .map_err(|e| format!("Failed to backup hub resolver: {}", e))?;
+            }
+            fs::write(&resolver, patched)
+                .map_err(|e| format!("Failed to write patched hub resolver: {}", e))?;
+            Ok(format!(
+                "hub licensing client resolver patched ({} v{}); editors launched from Hub now bypass ULF signature check",
+                line, ver
+            ))
+        }
     }
-    fs::write(&resolver, patched).map_err(|e| format!("Failed to write patched hub resolver: {}", e))?;
-    Ok("hub licensing client resolver patched (LocalIPC 1.17.x); editors launched from Hub now bypass ULF signature check".into())
 }
 
 /// 根据 app.asar 路径推导 Hub 可执行文件路径（fuse 存在 exe 里）

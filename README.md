@@ -1,4 +1,4 @@
-# UniFree 2.8.1
+# UniFree 2.8.2
 
 [English](README.md) | [中文](README_CN.md)
 
@@ -9,7 +9,7 @@
 - **Unity Hub Patching** - Bypass license validation via JavaScript patching (UniHacker method)
 - **Unity Editor Patching** - Version-aware patching to bypass signature verification
   - Unity 6000.7+: **Native AOT binary patching** — 1 byte-level anchor short-circuits `ValidateSignature` entirely
-  - Unity 6000.0-6000.6: replaces `Unity.Licensing.EntitlementResolver.dll`
+  - Unity 6000.0-6000.6: **in-place IL byte patch** of `Unity.Licensing.EntitlementResolver.dll` (any LocalIPC line, ReadyToRun disabled)
   - Unity 2019-2022: replaces `System.Security.Cryptography.Xml.dll`
 - **License Generation** - Generate RSA-signed Unity Pro license files from hardware info
 - **Custom Paths** - Support custom Hub and Editor scan directories
@@ -53,7 +53,7 @@ Version-aware patching that bypasses `ValidateSignature`:
 | Unity Version | Target File | Method |
 |---------------|------------|--------|
 | **6000.7+** | `Unity.Licensing.Client.exe` | **Byte-level anchor-based patching** (1 patch: `ValidateSignature` wrapper → always valid) |
-| 6000.0-6000.6 | `Unity.Licensing.EntitlementResolver.dll` | Pre-patched DLL replacement |
+| 6000.0-6000.6 | `Unity.Licensing.EntitlementResolver.dll` | In-place IL byte patch (any LocalIPC line) · falls back to pre-patched DLL per line |
 | 2019.x | `Unity.exe` + `System.Security.Cryptography.Xml.dll` | Native anchor patch (`ValidateServerProcess` → always valid) + pre-patched DLL replacement |
 | 2020-2022 | `System.Security.Cryptography.Xml.dll` | Pre-patched DLL replacement |
 
@@ -74,10 +74,10 @@ For 6000.7+, the binary is .NET 10 Native AOT compiled (no IL). Patches use patt
 |-----------|------|--------|
 | Hub | `app.asar` | Rebuild in-place (preserve unpacked markers), patch `getLicense`/`isLicenseValid` |
 | Hub | `Unity Hub.exe` | Flip Electron `EnableEmbeddedAsarIntegrityValidation` fuse |
-| Hub | `UnityLicensingClient_V1\Unity.Licensing.EntitlementResolver.dll` | Replace with pre-patched DLL (v2.8.1, 1.17.x line) |
+| Hub | `UnityLicensingClient_V1\Unity.Licensing.EntitlementResolver.dll` | In-place IL byte patch (any LocalIPC line; 1.17.x / 1.18+ / future) |
 | Hub | `hubConfig.json` | Update sign-in and update settings |
 | Editor (6000.7+) | `Unity.Licensing.Client.exe` | Byte-level binary patch (1 anchor-based patch) |
-| Editor (6000.0-6000.6) | `Unity.Licensing.EntitlementResolver.dll` | Replace with pre-patched DLL (per 1.17.x / 1.18+ line, v2.8.1) |
+| Editor (6000.0-6000.6) | `Unity.Licensing.EntitlementResolver.dll` | In-place IL byte patch (any LocalIPC line) · falls back to pre-patched DLL per line |
 | Editor (2019.x) | `Unity.exe` + `System.Security.Cryptography.Xml.dll` | Native anchor patch + replace with pre-patched DLL |
 | Editor (2020-2022) | `System.Security.Cryptography.Xml.dll` | Replace with pre-patched DLL |
 | License | `C:\ProgramData\Unity\Unity_lic.ulf` | Generate RSA-signed license file |
@@ -124,9 +124,28 @@ MIT License - See [LICENSE](LICENSE) for details
 
 ---
 
-**UniFree 2.8.1** - Unity License Freedom Tool
+**UniFree 2.8.2** - Unity License Freedom Tool
 
 ## Changelog
+
+### v2.8.2
+- **In-place IL byte patch replaces pre-patched resolver DLLs (6000.0-6000.6 & Hub)**: instead of swapping in a
+  rebuild-per-line DLL, the tool now rewrites `ValidateSignature`'s IL directly in the original file —
+  `brtrue.s`+`ldstr`+`newobj`+`throw` → `pop`+12×`nop` (13-byte, stack-equivalent) — preserving the
+  assembly identity, so **any LocalIPC release line works out of the box** (1.17.x, 1.18+, future lines),
+  no longer requiring per-line prebuilt binaries. Pre-patched DLLs remain as an automatic fallback.
+- **ReadyToRun fix (critical)**: Unity's resolver is a ReadyToRun image (`RTR`, ManagedNativeHeader). The CLI
+  header's `ManagedNativeHeader` is now zeroed during the patch, otherwise the runtime keeps executing the
+  stale native code and the IL patch silently never takes effect (dnlib validation passes, runtime behavior
+  doesn't). Verified end-to-end: the licensing client logs
+  `Successfully parsed (ULF) license ...`, `Processed 2 license files` with a UniFree-signed ULF.
+- **Unity Hub 3.21.1 support (LocalIPC 1.18.3)**: `patch_hub_licensing_client()` now patches the Hub's own
+  licensing client for the 1.18+ line too (in-place first, per-line fallback). Fixes editors launched from
+  the Hub failing with exit code 198 (`No valid Unity Editor license found.`) when the Hub client protocol
+  matches the editor's 1.18.3 client — previously only the 1.17.x line was supported.
+- Added `tools/verify-resolver` (dnlib structural validation of patched resolvers) and
+  `tools/resolver-invoke` (direct reflection invocation of `XmlExtensions.ValidateSignature`).
+- See `docs/editor-dll-patching.md` for details.
 
 ### v2.8.1
 - **Fixed "No valid Unity Editor license found." after patching 6000.3.10f1 (LocalIPC 1.17.x)**:
@@ -173,7 +192,7 @@ MIT License - See [LICENSE](LICENSE) for details
   - `flip_hub_exe_fuses()` disables the asar-integrity fuse in `Unity Hub.exe` (Electron fuse wire: `[magic][ver=01][len=09][ASCII bits]`, fuse 4).
   - `rewrite_hub_asar()` rebuilds `app.asar` in-place while preserving the 10 `unpacked` native-module markers (AsarWriter would drop them → `Cannot find native binding`).
   - Patches `licenseQueryService.getLicense()` to return a fake Unity Pro ULF so the Hub **displays** the license, plus `isLicenseValid()` → `true`.
-- Hub licensing client (managed .NET, `EntitlementResolver.dll` 1.17.4, same version line as 6000.3.10f1-class editors) is a different architecture from Editor 6000.7+ Native AOT; since v2.8.1 the Hub's licensing client resolver is also replaced with a pre-patched version, so editors launched from the Hub pass the ULF signature check through the Hub's licensing client (global pipe `LicenseClient-wbn`) — no standalone IPC process needed, patch once and it survives restarts (see `docs/editor-dll-patching.md`).
+- Hub licensing client (managed .NET, `EntitlementResolver.dll`) is a different architecture from Editor 6000.7+ Native AOT; since v2.8.1/2.8.2 the Hub's licensing client resolver is patched in-place (any LocalIPC line), so editors launched from the Hub pass the ULF signature check through the Hub's licensing client (global pipe `LicenseClient-wbn`) — no standalone IPC process needed, patch once and it survives restarts (see `docs/editor-dll-patching.md`).
 
 ### v2.5.7
 - **6000.7+ patch simplified to a single byte-level patch**: short-circuits the `ValidateSignature` wrapper (`sub_1404F1C10`) with `mov eax,1; ret`, replacing the previous 2-patch (signature gate + LABEL_14 trust check) and the original 4-patch approach

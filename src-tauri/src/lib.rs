@@ -2,6 +2,7 @@ mod alf_generator;
 mod app_config;
 mod commands;
 mod config_patcher;
+mod il_patch;
 mod license;
 mod patcher;
 mod scanner;

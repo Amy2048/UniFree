@@ -1,4 +1,4 @@
-# UniFree 2.8.1
+# UniFree 2.8.2
 
 [English](README.md) | [中文](README_CN.md)
 
@@ -9,7 +9,7 @@
 - **Unity Hub 补丁** - 通过 JavaScript 补丁绕过许可证验证（UniHacker 方法）
 - **Unity Editor 补丁** - 版本感知补丁，绕过签名验证
   - Unity 6000.7+：**Native AOT 二进制补丁** — 1 个字节级锚点，直接短路整个 ValidateSignature 验证
-  - Unity 6000.0-6000.6：替换 `Unity.Licensing.EntitlementResolver.dll`
+  - Unity 6000.0-6000.6：**就地 IL 字节补丁** `Unity.Licensing.EntitlementResolver.dll`（任意 LocalIPC 线通用，并禁用 ReadyToRun）
   - Unity 2019-2022：替换 `System.Security.Cryptography.Xml.dll`
 - **许可证生成** - 从硬件信息生成 RSA 签名的 Unity Pro 许可证文件
 - **自定义路径** - 支持自定义 Hub 和 Editor 扫描目录
@@ -53,7 +53,7 @@ UniFree 就地重建 `app.asar`（保留 `app.asar.unpacked/` 里的 native 模�
 | Unity 版本 | 目标文件 | 方法 |
 |------------|----------|------|
 | **6000.7+** | `Unity.Licensing.Client.exe` | **字节级锚点补丁**（1 个补丁：ValidateSignature 包装函数 → 恒为有效） |
-| 6000.0-6000.6 | `Unity.Licensing.EntitlementResolver.dll` | 预补丁 DLL 替换 |
+| 6000.0-6000.6 | `Unity.Licensing.EntitlementResolver.dll` | 就地 IL 字节补丁（任意 LocalIPC 线）· 未命中时回退按线选预补丁 DLL |
 | 2019-2022 | `System.Security.Cryptography.Xml.dll` | 预补丁 DLL 替换 |
 
 对于 6000.7+，二进制文件为 .NET 10 Native AOT 编译（无 IL 代码）。补丁使用模式匹配锚点定位并修改原生指令，在同发布线内具有跨小版本的兼容性。详见 `docs/editor-dll-patching.md`。
@@ -73,10 +73,10 @@ UniFree 就地重建 `app.asar`（保留 `app.asar.unpacked/` 里的 native 模�
 |------|------|------|
 | Hub | `app.asar` | 就地重建（保留 unpacked 标记），补丁 `getLicense`/`isLicenseValid` |
 | Hub | `Unity Hub.exe` | 翻转 Electron `EnableEmbeddedAsarIntegrityValidation` fuse |
-| Hub | `UnityLicensingClient_V1\Unity.Licensing.EntitlementResolver.dll` | 替换为预补丁 DLL（v2.8.1，1.17.x 线） |
+| Hub | `UnityLicensingClient_V1\Unity.Licensing.EntitlementResolver.dll` | 就地 IL 字节补丁（任意 LocalIPC 线：1.17.x / 1.18+ / 未来） |
 | Hub | `hubConfig.json` | 更新登录和更新设置 |
 | Editor (6000.7+) | `Unity.Licensing.Client.exe` | 字节级二进制补丁（1 个锚点补丁） |
-| Editor (6000.0-6000.6) | `Unity.Licensing.EntitlementResolver.dll` | 替换为预补丁 DLL（按 1.17.x / 1.18+ 发行线选择，v2.8.1） |
+| Editor (6000.0-6000.6) | `Unity.Licensing.EntitlementResolver.dll` | 就地 IL 字节补丁（任意 LocalIPC 线）· 未命中时回退按线选预补丁 DLL |
 | Editor (2019-2022) | `System.Security.Cryptography.Xml.dll` | 替换为预补丁 DLL |
 | License | `C:\ProgramData\Unity\Unity_lic.ulf` | 生成 RSA 签名的许可证文件 |
 
@@ -122,9 +122,25 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)
 
 ---
 
-**UniFree 2.8.1** - Unity 许可证自由工具
+**UniFree 2.8.2** - Unity 许可证自由工具
 
 ## 更新日志
+
+### v2.8.2
+- **就地 IL 字节补丁取代预补丁 resolver DLL（6000.0-6000.6 与 Hub）**：不再按发行线替换重编译 DLL，
+  而是直接改写原文件里 `ValidateSignature` 的 IL——`brtrue.s`+`ldstr`+`newobj`+`throw` →
+  `pop`+12×`nop`（13 字节等长、栈语义等价）——保留程序集身份，**任意 LocalIPC 发行线直接可用**
+  （1.17.x、1.18+、未来新线），无需再维护按线预编译产物；预补丁 DLL 保留为自动回退。
+- **ReadyToRun 修复（关键）**：Unity 的 resolver 是 ReadyToRun 镜像（`RTR`，ManagedNativeHeader）。
+  补丁时同步清零 CLI 头的 `ManagedNativeHeader`，否则运行时仍执行旧的原生码，IL 补丁静默失效
+  （dnlib 验证"通过"、运行期行为不变）。已端到端实测：licensing client 对 UniFree 签名的 ULF
+  输出 `Successfully parsed (ULF) license ...`、`Processed 2 license files`。
+- **Unity Hub 3.21.1 支持（LocalIPC 1.18.3）**：`patch_hub_licensing_client()` 现在也支持 1.18+ 线
+  （就地补丁优先，按线回退）。修复了 Hub client 协议与编辑器 1.18.3 一致时，从 Hub 启动的编辑器
+  报退出码 198（`No valid Unity Editor license found.`）的问题——此前只适配 1.17.x 线。
+- 新增 `tools/verify-resolver`（dnlib 结构校验补丁产物）与 `tools/resolver-invoke`
+  （反射直接调用 `XmlExtensions.ValidateSignature` 验证语义）。
+- 详见 `docs/editor-dll-patching.md`。
 
 ### v2.8.1
 - **修复 6000.3.10f1（LocalIPC 1.17.x）补丁后仍报 "No valid Unity Editor license found."**：
@@ -173,9 +189,10 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)
     （AsarWriter 会丢掉 → 报 `Cannot find native binding`）
   - patch `licenseQueryService.getLicense()` 返回假的 Unity Pro ULF，让 Hub **显示**许可证；
     `isLicenseValid()` → true
-- Hub 的 licensing client（managed .NET，`Unity.Licensing.EntitlementResolver.dll` 1.17.4，与
-  Editor 6000.3.10f1 等 1.17.x 编辑器同一版本族）与 Editor 6000.7+ Native AOT 是两套架构；
-  **同时替换 Hub licensing client 的 resolver 为预补丁版本**（v2.8.1 起）：从 Hub 启动的
+- Hub 的 licensing client（managed .NET，`Unity.Licensing.EntitlementResolver.dll`）与
+  Editor 6000.7+ Native AOT 是两套架构；
+  **就地 IL 补丁 Hub licensing client 的 resolver**（v2.8.2 起，任意 LocalIPC 线：
+  1.17.x / 1.18+ / 未来）：从 Hub 启动的
   编辑器经由 Hub 的 licensing client（全局管道 `LicenseClient-wbn`）也能通过 ULF 签名校验，
   无需启动独立 IPC 进程，补丁一次永久生效（含重启后，见 `docs/editor-dll-patching.md`）。
 
